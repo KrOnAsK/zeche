@@ -1,0 +1,316 @@
+{% extends "base.html" %}
+{% block title %}Zeche — check the items{% endblock %}
+{% block content %}
+
+<h2>Check what it read</h2>
+<p class="lede" id="lede">Loading…</p>
+
+<div id="check"></div>
+<div id="rows"></div>
+
+<div class="btnrow">
+  <button id="add">+ Add an item</button>
+  <button id="retranslate" class="hidden">Translate again</button>
+</div>
+
+<h2>Tip &amp; leftovers</h2>
+<div class="pair">
+  <label class="field" style="margin:0">
+    <span>Tip</span>
+    <input type="number" id="tip" inputmode="decimal" step="0.10" min="0">
+  </label>
+  <label class="field" style="margin:0">
+    <span>Currency</span>
+    <input type="text" id="currency" maxlength="4">
+  </label>
+</div>
+
+<label class="toggle" style="margin-top:14px">
+  <input type="checkbox" id="tipEqual">
+  <span class="knob"></span>
+  <span><b>Split the tip equally</b>
+  <small>Off: shared in proportion to what each person ate.</small></span>
+</label>
+
+<label class="toggle">
+  <input type="checkbox" id="unclaimedEqual">
+  <span class="knob"></span>
+  <span><b>Share leftover items equally</b>
+  <small>Off: unclaimed items stay on whoever paid.</small></span>
+</label>
+
+<div style="margin-top:18px"><button class="primary" id="publish">Save &amp; get the link</button></div>
+<div class="btnrow">
+  <button id="save">Save only</button>
+  <button id="lock">Close the bill</button>
+</div>
+
+<h2>Tricount</h2>
+<div id="tri">
+  <p class="lede" id="triLede" style="margin-bottom:12px">Push this bill in as one expense, split unequally.</p>
+  <label class="field" id="triLinkWrap">
+    <span>Sharing link</span>
+    <input type="text" id="triLink" placeholder="https://tricount.com/tABC123xyz" autocomplete="off" inputmode="url">
+  </label>
+  <div class="btnrow" style="margin-top:0">
+    <button id="triLookup">Match names</button>
+    <button id="triCopy">Copy the numbers</button>
+  </div>
+  <div id="triMap" class="hidden" style="margin-top:14px"></div>
+  <div id="triMsg"></div>
+</div>
+
+<div id="share" class="hidden">
+  <h2>Send it round the table</h2>
+  <div class="qrcard">
+    <img id="qr" alt="QR code for this bill">
+    <p class="cap">Hold a phone camera over this and the bill opens.</p>
+  </div>
+  <div class="linkbox">
+    <code id="shareUrl"></code>
+    <button class="ghost" id="copy">Copy</button>
+  </div>
+  <div class="btnrow">
+    <button class="primary" id="send" style="width:auto">Share the link</button>
+    <button id="open">Open it</button>
+  </div>
+  <p class="lede" style="margin:16px 0 0">Bookmark the link you're on right now. It's the only way back into this editor, and it's the only link that can change prices.</p>
+</div>
+
+{% endblock %}
+{% block script %}
+<script>
+const BILL = "{{ bill_id }}";
+const TOKEN = "{{ token }}";
+const rowsEl = document.getElementById('rows');
+let state = null;
+let BASE = location.origin;
+
+function card(item) {
+  const name = el('input', { type: 'text', value: item.name, 'aria-label': 'Item name' });
+  const qty = el('input', { class: 'n', type: 'number', step: '1', min: '0', value: item.qty, 'aria-label': 'Quantity' });
+  const total = el('input', { class: 'n money', type: 'text', inputmode: 'decimal', value: Number(item.total).toFixed(2), 'aria-label': 'Line total' });
+  const box = el('div', { class: 'ecard' },
+    el('div', { class: 'top' }, name,
+      el('button', { class: 'x', title: 'Remove', 'aria-label': 'Remove ' + item.name, onclick: () => { box.remove(); checkPanel(); } }, '×')),
+    el('div', { class: 'bot' }, qty, el('span', { class: 'times', text: '×' }), total),
+    item.name_src ? el('div', { class: 'src', text: 'receipt: ' + item.name_src }) : null);
+  box.dataset.id = item.id || '';
+  box.dataset.src = item.name_src || '';
+  return box;
+}
+
+function collect() {
+  return [...rowsEl.children].map(r => {
+    const [name, qty, total] = r.querySelectorAll('input');
+    return {
+      id: r.dataset.id || null,
+      name: name.value.trim() || 'Position',
+      name_src: r.dataset.src || null,
+      qty: parseMoney(qty.value) || 1,
+      total: parseMoney(total.value),
+    };
+  }).filter(i => i.name);
+}
+
+function checkPanel() {
+  const b = state.bill, sum = collect().reduce((a, i) => a + i.total, 0);
+  const box = document.getElementById('check');
+  box.innerHTML = '';
+  if (b.stated_total == null) return;
+  const diff = Math.abs(sum - b.stated_total);
+  box.append(el('div', { class: 'note' + (diff < 0.02 ? ' ok' : '') },
+    diff < 0.02
+      ? `Items add up to ${money(sum, b.currency)}, matching the total printed on the receipt.`
+      : `Items add up to ${money(sum, b.currency)} but the receipt says ${money(b.stated_total, b.currency)}. Something was misread — fix it before sharing.`));
+}
+
+function draw() {
+  rowsEl.innerHTML = '';
+  state.items.forEach(i => rowsEl.append(card(i)));
+  if (!state.items.length) rowsEl.append(card({ name: '', qty: 1, total: 0 }));
+  checkPanel();
+  lockLabel();
+}
+
+async function load() {
+  state = await api(`/api/bills/${BILL}`);
+  const b = state.bill;
+  document.getElementById('lede').textContent = state.items.length
+    ? `${state.items.length} items${b.title ? ' at ' + b.title : ''}. Fix anything the scan got wrong.`
+    : 'Nothing was read from the photo. Type the items in below.';
+  document.getElementById('tip').value = Number(b.tip_amount).toFixed(2);
+  document.getElementById('currency').value = b.currency;
+  document.getElementById('tipEqual').checked = b.tip_mode === 'equal';
+  document.getElementById('unclaimedEqual').checked = b.unclaimed_mode === 'equal';
+  draw();
+  rowsEl.addEventListener('input', checkPanel);
+
+  const cfg = await api('/api/config').catch(() => ({ translate: false }));
+  if (!cfg.tricount) {
+    document.getElementById('triLinkWrap').classList.add('hidden');
+    document.getElementById('triLookup').classList.add('hidden');
+    document.getElementById('triLede').textContent =
+      'No tricount client on this server — copy the numbers and type them into the app.';
+  } else if (state.bill.tricount_key || cfg.tricount_default_key) {
+    triLink.value = 'https://tricount.com/' + (state.bill.tricount_key || cfg.tricount_default_key);
+  }
+  if (state.bill.tricount_tx) triSay('This bill has already been added to the tricount.', '');
+  if (cfg.translate) document.getElementById('retranslate').classList.remove('hidden');
+  // ZECHE_BASE_URL wins so the link you hand out is the tunnel hostname, not
+  // whatever address you happen to be reaching the container on.
+  BASE = cfg.base_url || location.origin;
+}
+
+async function save() {
+  state = await api(`/api/bills/${BILL}?t=${TOKEN}`, {
+    method: 'PUT',
+    body: {
+      currency: document.getElementById('currency').value.trim() || '€',
+      tip_amount: parseMoney(document.getElementById('tip').value),
+      tip_mode: document.getElementById('tipEqual').checked ? 'equal' : 'proportional',
+      unclaimed_mode: document.getElementById('unclaimedEqual').checked ? 'equal' : 'ignore',
+      items: collect(),
+    },
+  });
+  draw();
+}
+
+const lockBtn = document.getElementById('lock');
+function lockLabel() { lockBtn.textContent = state.bill.locked ? 'Reopen the bill' : 'Close the bill'; }
+lockBtn.onclick = async () => {
+  state = await api(`/api/bills/${BILL}?t=${TOKEN}`, { method: 'PUT', body: { locked: !state.bill.locked } });
+  lockLabel();
+};
+
+document.getElementById('add').onclick = () => {
+  rowsEl.append(card({ name: '', qty: 1, total: 0 }));
+  rowsEl.lastElementChild.querySelector('input').focus();
+};
+
+document.getElementById('retranslate').onclick = async (e) => {
+  e.target.disabled = true;
+  const was = e.target.textContent;
+  e.target.textContent = 'Translating…';
+  try { await save(); state = await api(`/api/bills/${BILL}/translate?t=${TOKEN}`, { method: 'POST', body: {} }); draw(); }
+  catch (err) { alert(err.message); }
+  e.target.textContent = was;
+  e.target.disabled = false;
+};
+
+document.getElementById('save').onclick = async (e) => {
+  e.target.textContent = 'Saving…';
+  await save();
+  e.target.textContent = 'Saved';
+  setTimeout(() => (e.target.textContent = 'Save only'), 1200);
+};
+
+document.getElementById('publish').onclick = async () => {
+  await save();
+  const url = BASE + '/b/' + BILL;
+  const share = document.getElementById('share');
+  document.getElementById('shareUrl').textContent = url.replace(/^https?:\/\//, '');
+  document.getElementById('qr').src = `/b/${BILL}/qr.svg`;
+  share.classList.remove('hidden');
+  share.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  document.getElementById('open').onclick = () => (location.href = url);
+  document.getElementById('send').onclick = (e) => shareLink(url, state.bill.title || 'Split the bill', e.target);
+  document.getElementById('copy').onclick = async (e) => {
+    try { await navigator.clipboard.writeText(url); e.target.textContent = 'Copied'; }
+    catch { e.target.textContent = 'Select it'; }
+    setTimeout(() => (e.target.textContent = 'Copy'), 1500);
+  };
+};
+
+// ---------- Tricount ----------
+const triLink = document.getElementById('triLink');
+const triMap = document.getElementById('triMap');
+const triMsg = document.getElementById('triMsg');
+let triMembers = [], triMapping = {};
+
+function triSay(text, kind) {
+  triMsg.innerHTML = '';
+  if (text) triMsg.append(el('div', { class: 'note ' + (kind || ''), text }));
+}
+
+// Always available, even if the unofficial API is down or gone: the numbers in
+// the order Tricount's custom-split screen asks for them.
+function summaryText() {
+  const cur = state.bill.currency, t = state.totals;
+  const lines = [
+    `${state.bill.title || 'Restaurant'} — ${money(t.grand_total, cur)}`,
+    `Paid by ${state.bill.paid_by || '?'}`,
+    '',
+  ];
+  for (const r of t.rows) lines.push(`${r.name}: ${Number(r.owes).toFixed(2)}`);
+  if (t.tip_total) lines.push('', `(incl. ${money(t.tip_total, cur)} tip)`);
+  return lines.join('\n');
+}
+
+document.getElementById('triCopy').onclick = async (e) => {
+  const text = summaryText();
+  try { await navigator.clipboard.writeText(text); e.target.textContent = 'Copied'; }
+  catch { triSay(text, 'info'); e.target.textContent = 'Shown below'; }
+  setTimeout(() => (e.target.textContent = 'Copy the numbers'), 1600);
+};
+
+function drawMapping() {
+  triMap.innerHTML = '';
+  triMap.classList.remove('hidden');
+  triMap.append(el('div', { class: 'flabel', text: 'Who is who' }));
+  for (const r of state.totals.rows) {
+    const sel = el('select', {
+      onchange: (ev) => { triMapping[r.person_id] = ev.target.value; },
+    }, el('option', { value: '', text: '— not in the tricount —' }));
+    for (const m of triMembers) {
+      const o = el('option', { value: m.id, text: m.name });
+      if (triMapping[r.person_id] === m.id) o.selected = true;
+      sel.append(o);
+    }
+    triMap.append(el('div', { class: 'erow', style: 'grid-template-columns: 1fr 1fr; gap:8px; margin-bottom:8px' },
+      el('div', {}, el('b', { text: r.name }),
+        el('span', { class: 'src', style: 'display:block', text: money(r.owes, state.bill.currency) })),
+      sel));
+  }
+  const push = el('button', { class: 'primary', onclick: doPush }, 'Add to the tricount');
+  triMap.append(el('div', { style: 'margin-top:12px' }, push));
+}
+
+document.getElementById('triLookup').onclick = async (e) => {
+  e.target.disabled = true; e.target.textContent = 'Looking up…';
+  try {
+    await save();
+    const r = await api(`/api/bills/${BILL}/tricount/lookup?t=${TOKEN}`, {
+      method: 'POST', body: { link: triLink.value },
+    });
+    triMembers = r.members; triMapping = r.mapping || {};
+    triLink.value = 'https://tricount.com/' + r.key;
+    drawMapping();
+    triSay(r.pushed_tx
+      ? `Already pushed to "${r.title}". Adding it again would double the expense.`
+      : `Found "${r.title}" with ${r.members.length} members.`,
+      r.pushed_tx ? '' : 'ok');
+  } catch (err) { triSay(err.message); }
+  e.target.disabled = false; e.target.textContent = 'Match names';
+};
+
+async function doPush(ev) {
+  ev.target.disabled = true; ev.target.textContent = 'Adding…';
+  try {
+    const r = await api(`/api/bills/${BILL}/tricount/push?t=${TOKEN}`, {
+      method: 'POST', body: { link: triLink.value, mapping: triMapping },
+    });
+    triMap.classList.add('hidden');
+    triSay(`Added "${r.description}" for ${money(r.total, state.bill.currency)}. `
+      + `The bill is now closed so nobody can change it out from under the tricount.`, 'ok');
+    state = await api(`/api/bills/${BILL}`);
+    lockLabel();
+  } catch (err) {
+    triSay(err.message);
+    ev.target.disabled = false; ev.target.textContent = 'Add to the tricount';
+  }
+}
+
+load();
+</script>
+{% endblock %}
